@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>GeoRoute Safety Dashboard</title>
+
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.113/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.113/Build/Cesium/Widgets/widgets.css" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+html, body, #cesiumContainer {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: sans-serif;
+}
+
+.sidebar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 330px;
+  height: 100%;
+  background: rgba(20,20,20,0.97);
+  color: white;
+  padding: 20px;
+  z-index: 999;
+  overflow-y: auto;
+}
+
+.section { margin-bottom: 20px; }
+
+h2, h3 { margin-top: 0; }
+
+button {
+  width: 100%;
+  padding: 6px;
+  margin-top: 6px;
+  background: #2e86de;
+  border: none;
+  color: white;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+button:hover { background: #1b4f72; }
+
+input[type="range"] { width: 100%; }
+
+.status-box {
+  padding: 10px;
+  border-radius: 6px;
+  text-align: center;
+  font-weight: bold;
+  margin-top: 10px;
+}
+
+.safe { background: #1e8449; }
+.warning { background: #d68910; }
+.danger { background: #c0392b; }
+
+.metrics {
+  background: #2c3e50;
+  padding: 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.chart-box {
+  background: white;
+  padding: 10px;
+  border-radius: 6px;
+}
+</style>
+</head>
+<body>
+
+<div id="cesiumContainer"></div>
+
+<div class="sidebar">
+  <h2>GeoRoute Safety Dashboard</h2>
+
+  <div class="section">
+    <h3>Layers</h3>
+    <label><input type="checkbox" id="ndviToggle" checked> NDVI</label><br/>
+    <label><input type="checkbox" id="ndwiToggle" checked> NDWI</label><br/><br/>
+    Opacity
+    <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.7">
+  </div>
+
+  <div class="section">
+    <h3>Route Tools</h3>
+    <button id="startDraw">Start Route</button>
+    <button id="stopDraw">Stop & Analyze</button>
+    <button id="clearRoute">Clear Route</button>
+    <button id="saveRoute">Export GeoJSON</button>
+  </div>
+
+  <div class="section">
+    <h3>Route Status</h3>
+    <div id="statusBox" class="status-box safe">SAFE</div>
+  </div>
+
+  <div class="section">
+    <h3>Route Metrics</h3>
+    <div id="metricsBox" class="metrics">
+      Distance: - <br/>
+      Elevation Gain: - <br/>
+      Max Slope: - <br/>
+      Risk: -
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>Elevation Profile</h3>
+    <div class="chart-box">
+      <canvas id="elevationChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+
+// ================= TOKEN =================
+Cesium.Ion.defaultAccessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI4NzU3NzMzYi02YzdhLTRkMTItYjM2NS1iYzE0ZWJkNDA2MzEiLCJpZCI6Mzg3Mjk4LCJpYXQiOjE3NzAyNzkxNDZ9.FrAOqmeY-jMTgzkXrtQPpoPEE5yGkOnSkYSSChmpn94";
+
+// ================= MAP =================
+const viewer = new Cesium.Viewer("cesiumContainer", {
+  terrain: Cesium.Terrain.fromWorldTerrain(),
+});
+viewer.scene.globe.depthTestAgainstTerrain = true;
+
+// ================= LAYERS =================
+let ndviLayer, ndwiLayer;
+
+async function loadLayers() {
+
+  const ndviProvider = await Cesium.IonImageryProvider.fromAssetId(4440174);
+  const ndwiProvider = await Cesium.IonImageryProvider.fromAssetId(4440176);
+
+  ndviLayer = viewer.imageryLayers.addImageryProvider(ndviProvider);
+  ndwiLayer = viewer.imageryLayers.addImageryProvider(ndwiProvider);
+
+  ndviLayer.alpha = 0.7;
+  ndwiLayer.alpha = 0.7;
+
+  viewer.camera.flyTo({ destination: ndviProvider.rectangle });
+
+  document.getElementById("ndviToggle").onchange =
+    e => ndviLayer.show = e.target.checked;
+
+  document.getElementById("ndwiToggle").onchange =
+    e => ndwiLayer.show = e.target.checked;
+
+  document.getElementById("opacity").oninput =
+    e => {
+      ndviLayer.alpha = e.target.value;
+      ndwiLayer.alpha = e.target.value;
+    };
+}
+loadLayers();
+
+// ================= ROUTE =================
+let positions = [];
+let routeEntity = null;
+let drawing = false;
+let elevationChart;
+
+const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+
+handler.setInputAction(click => {
+  if (!drawing) return;
+  const cartesian = viewer.scene.pickPosition(click.position);
+  if (!cartesian) return;
+
+  positions.push(cartesian);
+
+  if (!routeEntity) {
+    routeEntity = viewer.entities.add({
+      polyline: {
+        positions: new Cesium.CallbackProperty(() => positions, false),
+        width: 4,
+        material: Cesium.Color.CYAN,
+        clampToGround: true
+      }
+    });
+  }
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+document.getElementById("startDraw").onclick = () => drawing = true;
+
+document.getElementById("clearRoute").onclick = () => {
+  positions = [];
+  if (routeEntity) viewer.entities.remove(routeEntity);
+  routeEntity = null;
+  updateStatus("SAFE");
+};
+
+document.getElementById("stopDraw").onclick = async () => {
+  drawing = false;
+  await analyzeRoute();
+};
+
+// ================= ANALYSIS ENGINE =================
+async function analyzeRoute() {
+
+  const terrainData = await Cesium.sampleTerrainMostDetailed(
+    viewer.terrainProvider,
+    positions.map(p => Cesium.Cartographic.fromCartesian(p))
+  );
+
+  let distance = 0;
+  let elevationGain = 0;
+  let maxSlope = 0;
+  let waterDetected = false;
+
+  for (let i = 1; i < terrainData.length; i++) {
+
+    const vertical = terrainData[i].height - terrainData[i-1].height;
+    const horizontal = Cesium.Cartesian3.distance(
+      positions[i-1], positions[i]
+    );
+
+    distance += horizontal;
+
+    if (vertical > 0) elevationGain += vertical;
+
+    const slope = Cesium.Math.toDegrees(Math.atan(Math.abs(vertical)/horizontal));
+    if (slope > maxSlope) maxSlope = slope;
+
+    if (slope > 25) routeEntity.polyline.material = Cesium.Color.ORANGE;
+  }
+
+  // WATER CHECK (Tile Sampling)
+  const imageryProvider = ndwiLayer.imageryProvider;
+  const tilingScheme = imageryProvider.tilingScheme;
+
+  for (let pos of positions) {
+    const carto = Cesium.Cartographic.fromCartesian(pos);
+    const level = imageryProvider.maximumLevel || 14;
+    const tileXY = tilingScheme.positionToTileXY(carto, level);
+    if (!tileXY) continue;
+
+    const image = await imageryProvider.requestImage(tileXY.x, tileXY.y, level);
+    if (!image) continue;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(image, 0, 0);
+
+    const rect = tilingScheme.tileXYToRectangle(tileXY.x, tileXY.y, level);
+
+    const x = (carto.longitude - rect.west)/(rect.east-rect.west)*image.width;
+    const y = (rect.north - carto.latitude)/(rect.north-rect.south)*image.height;
+
+    const pixel = ctx.getImageData(Math.floor(x), Math.floor(y), 1, 1).data;
+
+    if (pixel[2] > 120 && pixel[2] > pixel[0] + 15) {
+      waterDetected = true;
+      break;
+    }
+  }
+
+  // PRIORITY LOGIC
+  if (waterDetected) {
+    routeEntity.polyline.material = Cesium.Color.RED;
+    updateStatus("WATER RISK");
+  } else if (maxSlope > 25) {
+    routeEntity.polyline.material = Cesium.Color.ORANGE;
+    updateStatus("STEEP SLOPE");
+  } else {
+    routeEntity.polyline.material = Cesium.Color.CYAN;
+    updateStatus("SAFE");
+  }
+
+  updateMetrics(distance, elevationGain, maxSlope);
+  generateElevationProfile(terrainData, distance);
+}
+
+// ================= UI UPDATE =================
+function updateStatus(text) {
+
+  const box = document.getElementById("statusBox");
+  box.className = "status-box";
+
+  if (text === "SAFE") box.classList.add("safe");
+  else if (text === "STEEP SLOPE") box.classList.add("warning");
+  else box.classList.add("danger");
+
+  box.innerText = text;
+}
+
+function updateMetrics(distance, gain, slope) {
+  document.getElementById("metricsBox").innerHTML =
+    "Distance: " + (distance/1000).toFixed(2) + " km<br/>" +
+    "Elevation Gain: " + gain.toFixed(2) + " m<br/>" +
+    "Max Slope: " + slope.toFixed(2) + "°<br/>" +
+    "Risk: " + document.getElementById("statusBox").innerText;
+}
+
+// ================= CHART =================
+function generateElevationProfile(data, totalDistance) {
+
+  let distances = [];
+  let elevations = [];
+  let cumulative = 0;
+
+  for (let i = 0; i < data.length; i++) {
+
+    if (i > 0) {
+      cumulative += Cesium.Cartesian3.distance(
+        positions[i-1], positions[i]
+      );
+    }
+
+    distances.push((cumulative/1000).toFixed(2));
+    elevations.push(data[i].height.toFixed(2));
+  }
+
+  const ctx = document.getElementById("elevationChart").getContext("2d");
+
+  if (elevationChart) elevationChart.destroy();
+
+  elevationChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: distances,
+      datasets: [{
+        label: "Elevation (m)",
+        data: elevations,
+        borderColor: "blue",
+        tension: 0.3
+      }]
+    }
+  });
+}
+
+</script>
+</body>
+</html>
+
